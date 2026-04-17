@@ -1,0 +1,2346 @@
+---
+title: "Single-Cell RNA-seq Analysis of Lead-Exposed Human Neural Progenitor Cells"
+subtitle: "CAJAL Advanced Neuroscience Course — Bordeaux"
+author: ""
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r global-options, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.width = 8,
+  fig.height = 6
+)
+```
+
+------------------------------------------------------------------------
+
+# Before You Begin: Required Files
+
+All of the following files must be present in your working directory
+before running this worksheet. If any are missing, ask your instructor.
+
+| File                             | Description                                                  |
+|--------------------------|----------------------------------------------|
+| `downsampled_Pb40.qs`            | Downsampled Seurat object (\~100k cells, pre-QC)             |
+| `cell_metadata.csv`              | Barcode-to-donor demultiplexing output from Dropulation      |
+| `ensembl_to_symbol.tsv`          | Gencode V41 Ensembl ID to gene symbol and chromosome mapping |
+| `cell_cycle_markers_ensembl.csv` | S and G2M phase gene sets in Ensembl ID format               |
+| `NPCvsOther_genelist.csv`        | Marker genes distinguishing NPCs from other cell types       |
+| `NPCmarkers_shortgenelist.csv`   | Curated shortlist of canonical NPC marker genes              |
+
+All intermediate objects generated during the analysis will be saved to
+`Analysis_Outputs/0_seurat-objects/` in your working directory.
+
+------------------------------------------------------------------------
+
+# Section 1: Biological and Experimental Context
+
+## 1.1 The SNaP40 Pb Village Dataset
+
+The data you will analyze comes from an experiment designed to
+understand how **environmental lead (Pb) exposure affects human neural
+progenitor cell (NPC) transcription** across a genetically diverse
+population.
+
+NPCs are the proliferating progenitors that give rise to neurons and
+glia during brain development. They are particularly relevant for
+studying neurotoxicant exposure because the developing brain is far more
+sensitive to environmental insults than the adult brain — and because
+NPC dysfunction during development has lasting consequences for neuronal
+circuit formation and cognitive function.
+
+The cells in this experiment were derived from **induced pluripotent
+stem cells (iPSCs)** reprogrammed from 40 human donors with diverse
+genetic backgrounds. These iPSCs were differentiated into NPCs and then
+treated with lead acetate at three concentrations:
+
+-   **Control** — no lead exposure
+-   **Low** — 3 µM lead acetate
+-   **High** — 10 µM lead acetate
+
+This experimental design is called a **"village" experiment**: rather
+than differentiating and treating each donor's cells independently
+(which would be prohibitively expensive and introduce batch effects
+between donors), all 40 donors' cells are pooled together into a single
+culture dish per condition and treated simultaneously. This is possible
+because each donor's cells carry a unique genotype, allowing them to be
+computationally identified and separated after sequencing using a
+process called **genotype-based demultiplexing**.
+
+## 1.2 Why 40 Donors, and Why It Matters for Analysis
+
+By profiling 40 donors simultaneously, the experiment has enough
+statistical power to ask: *what is the shared transcriptional response
+to lead across diverse human genetic backgrounds?*
+
+This design has a direct and important consequence for how we analyze
+the data. Each donor contributes thousands of cells to the dataset.
+Those cells are not independent observations — they share a genome, an
+epigenome, and a differentiation history. If we treat every cell as
+independent when testing for differential expression, we will massively
+overstate our statistical confidence. The correct approach is to treat
+**donor as the unit of replication**, not individual cells. We will
+return to this point in detail when we reach the differential expression
+section.
+
+## 1.3 What This Worksheet Covers
+
+This worksheet walks you through the complete analysis pipeline:
+
+1.  Loading the data and attaching donor metadata
+2.  Quality control — identifying and removing low-quality cells
+3.  Normalization, dimensionality reduction, and clustering
+4.  Assessing potential confounders (batch effects, cell cycle)
+5.  Cell type annotation using marker genes
+6.  Pseudobulk differential expression with `dreamlet`
+7.  Visualization of DEG results
+8.  Gene set enrichment analysis with `fgsea`
+
+------------------------------------------------------------------------
+
+# Section 2: Setup and Data Loading
+
+## 2.1 Libraries
+
+We load all required libraries upfront. If any package is not installed,
+use `install.packages()` for CRAN packages or `BiocManager::install()`
+for Bioconductor packages.
+
+```{r load-libraries, message=FALSE, warning=FALSE}
+# ── Project file path management ──────────────────────────────────────────────
+library(here)           # here() anchors paths to the R project root
+here::i_am("scrnaseq_analysis.Rproj")
+
+# ── Data wrangling ─────────────────────────────────────────────────────────────
+library(tidyverse)      # dplyr, ggplot2, readr, and friends
+library(data.table)     # fread() for fast flat file reading
+library(skimr)          # skim() for quick data summaries
+
+# ── Single-cell analysis ───────────────────────────────────────────────────────
+library(Seurat)         # Core scRNA-seq analysis toolkit (v5)
+library(Matrix)         # Sparse matrix support (~90% of scRNA-seq entries are 0)
+library(qs)             # qsave()/qread() — faster than saveRDS()/readRDS()
+library(scCustomize)    # QC plotting helpers and scRNA-seq utilities
+library(scater)         # Additional QC and single-cell utilities
+
+# ── Visualization ──────────────────────────────────────────────────────────────
+library(patchwork)      # Combining multiple ggplot objects
+library(ggrepel)        # Non-overlapping text labels on plots
+library(viridis)        # Colorblind-friendly color scales
+```
+
+```{r setup-directories}
+# Create a directory to store all intermediate Seurat objects.
+# All saved files will go here throughout the worksheet.
+output_dir <- here("Analysis_Outputs", "0_seurat-objects")
+
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+  message("Created output directory: ", output_dir)
+} else {
+  message("Output directory already exists: ", output_dir)
+}
+```
+
+## 2.2 Loading the Seurat Object
+
+The raw data for this experiment was aligned and quantified using
+STARsolo, which outputs per-cell count matrices with one row per gene
+and one column per cell barcode. These matrices were merged across the
+six experimental runs (two per condition) into a single Seurat object,
+and the full dataset of \~400,000 cells was downsampled to \~100,000
+cells for this course.
+
+A **Seurat object** is an S4 R object that stores count matrices,
+metadata, dimensionality reductions, and cluster assignments in a single
+place. When we first load it, it contains only the raw count matrix and
+three default metadata columns: `orig.ident` (which sample the cell came
+from), `nCount_RNA` (total UMIs detected), and `nFeature_RNA` (number of
+unique genes detected). Donor identity, treatment condition, and other
+biological metadata have not yet been attached.
+
+```{r load-seurat-object}
+# qread() is the companion to qsave() — both come from the qs package.
+# It is substantially faster than readRDS() for large R objects.
+gex <- qread(here("downsampled_Pb40.qs"))
+
+# Check the dimensions: rows = genes, columns = cells
+dim(gex)
+
+# Inspect the metadata — at this stage only three columns exist
+head(gex@meta.data)
+
+# How many cells came from each experimental run?
+table(gex$orig.ident)
+```
+
+## 2.3 Adding Donor-Level Metadata
+
+Because this is a village experiment, cells from all 40 donors are
+pooled together in each condition. After sequencing, each cell barcode
+is assigned to its donor of origin using **Dropulation**, a
+genotype-based demultiplexer. Dropulation compares the SNPs present in
+each cell's reads to a reference panel of known donor genotypes and
+assigns each cell barcode a probability-based donor identity.
+
+The output of this demultiplexing step — one row per cell barcode, with
+donor identity, treatment condition, sex, and other covariates — has
+been prepared for you in `cell_metadata.csv`. We attach it to the Seurat
+object using `AddMetaData()`, which joins the table by matching the
+`cellid` column to cell barcodes in `gex`.
+
+```{r add-donor-metadata}
+# Load the demultiplexing output and set cell barcodes as rownames
+# so AddMetaData() can match them to the Seurat object
+cell_metadata <- read_csv(here("cell_metadata.csv")) %>%
+  column_to_rownames("cellid")
+
+# Attach to the Seurat object
+gex <- AddMetaData(gex, cell_metadata)
+
+# Confirm the join worked — you should now see donor, treatment, sex,
+# origin, donorlabel, and sample_index alongside the original columns
+colnames(gex@meta.data)
+```
+
+```{r inspect-metadata}
+# How many cells were successfully assigned to a donor?
+# Cells with NA could not be confidently assigned and will be removed later.
+table(is.na(gex$donor))
+
+# Cells per treatment condition — should be roughly balanced
+table(gex$treatment)
+
+# Cells per donor — notice this is intentionally uneven. Genotype-based
+# demultiplexing assigns cells probabilistically, and some donors will be
+# better represented than others. This imbalance is real and will matter
+# when we aggregate to pseudobulk later: donors with very few cells in a
+# given cell type may be dropped from that cell type's model.
+table(gex$donor)
+
+# Save the annotated object
+qsave(gex, file.path(output_dir, "00-gex_with_metadata.qs"))
+```
+
+------------------------------------------------------------------------
+
+# Section 3: Quality Control
+
+## 3.1 Why QC Matters
+
+In scRNA-seq, each oligo tagged bead ideally captures the DNA from a
+single cell. In practice, a meaningful fraction of captured beads
+contain something other than a healthy intact cell:
+
+-   **Empty beads**— the bead captured ambient RNA but no cell. These
+    tend to have very low UMI counts and few detected genes.
+-   **Damaged or dying cells** — the cell membrane has ruptured before
+    capture, causing cytoplasmic mRNA to leak out. What remains is
+    enriched for mitochondrial transcripts (which are protected inside
+    mitochondria), so these barcodes have a disproportionately high
+    fraction of mitochondrial reads.
+-   **Doublets** — two cells were captured in the same well. These tend
+    to have unusually high UMI counts and gene counts relative to the
+    rest of the dataset.
+
+We use four per-cell metrics to identify and remove these low-quality
+barcodes:
+
+-   **`nCount_RNA`** — total UMIs detected. Very low = empty bead; very
+    high relative to the distribution = potential doublet.
+-   **`nFeature_RNA`** — number of unique genes detected. Low values
+    indicate low-complexity barcodes.
+-   **`percent_mito`** — fraction of UMIs mapping to mitochondrial
+    genes. High values indicate damaged or lysed cells.
+-   **`log10GenesPerUMI`** — transcriptional complexity score
+    (log10(nFeature) / log10(nCount)). Damaged cells and doublets tend
+    to have lower complexity than healthy single cells.
+
+An important principle: these metrics should be assessed **jointly**,
+not independently. A cell with moderately elevated mitochondrial
+fraction but high UMI count is less concerning than one that fails all
+four metrics simultaneously.
+
+## 3.2 Computing QC Metrics
+
+Our genes are stored as **Ensembl IDs** (e.g., `ENSG00000141510`) rather
+than gene symbols (e.g., `MT-CO1`). This means we cannot use simple
+pattern matching to identify mitochondrial genes — we need to use a
+genome annotation file to look up which Ensembl IDs correspond to genes
+encoded on the mitochondrial chromosome.
+
+```{r compute-qc-metrics}
+# Load the Gencode V41 annotation file.
+# This maps Ensembl gene IDs to gene symbols, chromosome (seqnames),
+# gene type, and other annotation fields.
+ensg_to_symbol <- read_tsv(here("ensembl_to_symbol.tsv"))
+
+# Ensembl IDs in annotation files often carry version numbers
+# (e.g., ENSG00000141510.18). Strip the version suffix so they match
+# the IDs stored in our Seurat object.
+ensg_to_symbol <- ensg_to_symbol %>%
+  mutate(gene_id = gsub("\\..*", "", gene_id))
+
+# Mitochondrial genes are encoded on chrM. Pull their Ensembl IDs.
+genes_MT <- ensg_to_symbol %>%
+  filter(seqnames == "chrM") %>%
+  pull(gene_id) %>%
+  unique()
+
+message(sprintf("%d mitochondrial genes identified", length(genes_MT)))
+
+# scCustomize provides a curated list of human ribosomal gene Ensembl IDs
+# (ensembl_ribo_id$Homo_sapiens_ribo_ensembl). Cross-reference against our
+# annotation to get only those present in this dataset.
+genes_ribo <- ensg_to_symbol %>%
+  filter(gene_id %in% ensembl_ribo_id$Homo_sapiens_ribo_ensembl) %>%
+  pull(gene_id) %>%
+  unique()
+
+message(sprintf("%d ribosomal genes identified", length(genes_ribo)))
+
+# Add_Mito_Ribo() calculates percent_mito and percent_ribo for each cell
+# and appends them to gex@meta.data. We pass our Ensembl-based lists
+# explicitly — the default symbol-based detection would fail here.
+gex <- Add_Mito_Ribo(
+  gex,
+  species       = "Human",
+  mito_features = genes_MT,
+  ribo_features = genes_ribo
+)
+
+# Add_Cell_Complexity() computes log10(nFeature_RNA) / log10(nCount_RNA)
+# and stores it as log10GenesPerUMI
+gex <- Add_Cell_Complexity(gex)
+
+# Confirm the new columns are present
+colnames(gex@meta.data)
+```
+
+```{r skim-qc-metrics}
+# A quick numerical summary of all QC metrics across all cells.
+# Pay attention to the distributions of percent_mito and log10GenesPerUMI —
+# these will guide threshold selection below.
+skim(gex@meta.data %>% select(nCount_RNA, nFeature_RNA,
+                               percent_mito, percent_ribo,
+                               log10GenesPerUMI))
+```
+
+## 3.3 Visualizing QC Distributions
+
+Before applying any filter, look at the data. Thresholds should be
+chosen based on the distributions you actually observe — not copied from
+a paper using a different cell type, protocol, or sequencing depth.
+
+```{r qc-summary-table}
+# Median QC statistics per sample. Record these — they belong in your
+# methods section when you write this up.
+(prefilter_stats <- Median_Stats(seurat_object = gex, group_by_var = "orig.ident"))
+```
+
+```{r set-thresholds}
+# Define your QC thresholds here. These variables are used in all
+# subsequent plots and in the filtering step. Adjust and re-run the
+# visualization chunks to see how different values would change your
+# retained cell count before committing.
+low_umi        <- 1000
+low_feature    <- 500
+high_mito      <- 25
+low_complexity <- 0.85
+```
+
+```{r plot-qc-violins, fig.width=12, fig.height=8}
+# Violin plots per sample. The dashed reference lines show where your
+# current thresholds sit — they do NOT filter cells at this step.
+# Look for consistency across samples: if one sample has a dramatically
+# different distribution, investigate before applying a global threshold.
+p1 <- QC_Plots_UMIs(gex,       low_cutoff  = low_umi,        pt.size = 0, plot_boxplot = TRUE)
+p2 <- QC_Plots_Genes(gex,      low_cutoff  = low_feature,    pt.size = 0, plot_boxplot = TRUE)
+p3 <- QC_Plots_Mito(gex,       high_cutoff = high_mito,      pt.size = 0, plot_boxplot = TRUE)
+p4 <- QC_Plots_Complexity(gex, low_cutoff  = low_complexity, pt.size = 0, plot_boxplot = TRUE)
+
+wrap_plots(p1, p2, p3, p4, ncol = 2)
+
+ggsave(here("Analysis_Outputs", "3-2_qc_violins_prefilter.png"),
+       width = 12, height = 8, dpi = 300)
+
+```
+
+```{r plot-qc-scatter, fig.width=12, fig.height=10}
+# Scatter plots show how metrics relate to each other across individual cells.
+# A cell that fails multiple metrics simultaneously is a much more confident
+# removal candidate than one that barely crosses a single threshold.
+meta_data <- Fetch_Meta(gex)
+
+# Genes vs UMIs, colored by % mito.
+# Healthy cells follow a tight diagonal — more sequencing depth (UMIs)
+# yields more detected genes. Cells sitting below the diagonal have fewer
+# unique genes than expected for their depth. Notice that the high-mito
+# cells (warm colors) tend to cluster in the lower-left: low UMIs, few
+# genes, high mito is the classic signature of a lysed cell.
+# Also notice the geometric "shelf" of points with moderate-to-high UMIs
+# but elevated mito — these are likely doublets, where one healthy cell
+# and one damaged cell were co-captured in the same bead
+
+p1 <- ggplot(meta_data, aes(x = nCount_RNA, y = nFeature_RNA, color = percent_mito)) +
+  geom_point(size = 0.3, alpha = 0.4) +
+  scale_color_viridis_c(option = "plasma") +
+  scale_x_log10() + scale_y_log10() +
+  geom_vline(xintercept = low_umi,     linetype = "dashed", color = "red") +
+  geom_hline(yintercept = low_feature, linetype = "dashed", color = "red") +
+  labs(title = "Genes vs UMIs (colored by % mito)",
+       x = "log10(UMIs per cell)", y = "log10(Genes per cell)",
+       color = "% Mito") +
+  theme_classic()
+
+# UMIs vs % mito.
+# High mito + low UMIs is the clearest indicator of a damaged cell.
+# The bimodal structure you see in the density plot below is visible here
+# too: a dense healthy population hugging the x-axis, and a high-mito
+# cloud spanning a wide range of UMI counts.
+p2 <- ggplot(meta_data, aes(x = nCount_RNA, y = percent_mito, color = nFeature_RNA)) +
+  geom_point(size = 0.3, alpha = 0.4) +
+  scale_color_viridis_c(option = "plasma") +
+  scale_x_log10() +
+  geom_hline(yintercept = high_mito, linetype = "dashed", color = "red") +
+  labs(title = "UMIs vs % Mitochondrial Expression",
+       x = "log10(UMIs per cell)", y = "% Mitochondrial",
+       color = "Genes") +
+  theme_classic()
+
+# Complexity vs % mito.
+# The upper-left quadrant — low complexity and high mito — contains the
+# most confidently low-quality cells. Cells in the lower-right are your
+# healthy population.
+p3 <- ggplot(meta_data, aes(x = log10GenesPerUMI, y = percent_mito,
+                              color = orig.ident)) +
+  geom_point(size = 0.3, alpha = 0.4) +
+  geom_vline(xintercept = low_complexity, linetype = "dashed", color = "red") +
+  geom_hline(yintercept = high_mito,      linetype = "dashed", color = "red") +
+  labs(title = "Complexity vs % Mitochondrial Expression",
+       x = "log10GenesPerUMI", y = "% Mitochondrial",
+       color = "Sample") +
+  theme_classic()
+
+# Density of % mito per sample.
+# This is where the bimodal distribution is most apparent. The sharp peak
+# around 5-10% represents intact healthy cells. The broad shoulder toward
+# 75% reflects damaged cells and doublets. A well-chosen mito threshold
+# should sit in the valley between these two modes — which is what our
+# 25% cutoff does. All six samples overlap closely, which tells us the
+# library quality is consistent across conditions.
+p4 <- ggplot(meta_data, aes(x = percent_mito, fill = orig.ident)) +
+  geom_density(alpha = 0.3) +
+  geom_vline(xintercept = high_mito, linetype = "dashed", color = "red") +
+  labs(title = "% Mitochondrial Expression per Sample",
+       x = "% Mitochondrial", y = "Density") +
+  theme_classic()
+
+wrap_plots(p1, p2, p3, p4, ncol = 2)
+ggsave(here("Analysis_Outputs", "3-2_qc_scatter_prefilter.png"),
+       width = 12, height = 10, dpi = 300)
+```
+
+## 3.4 Filtering
+
+We apply two sequential filters. First, we remove cells with no donor
+assignment — these cannot contribute to our donor-level differential
+expression model. About 19% of barcodes fall into this category, which
+is normal for genotype-based demultiplexing and reflects barcodes that
+could not be confidently assigned to a single donor.
+
+Second, we apply the QC metric thresholds. A cell must pass **all four**
+criteria simultaneously to be retained.
+
+Before committing, use the exploration block below to see exactly how
+many cells each threshold combination would retain.
+
+```{r explore-thresholds}
+# Test your thresholds without modifying gex.
+# Change low_umi, low_feature, high_mito, or low_complexity in the
+# set-thresholds chunk above and re-run this block to see the effect.
+test_subset <- subset(
+  x = gex[, !is.na(gex$donor)],
+  subset = (nFeature_RNA     >= low_feature)    &
+           (nCount_RNA       >= low_umi)         &
+           (log10GenesPerUMI >= low_complexity)  &
+           (percent_mito     <  high_mito)
+)
+
+message(sprintf(
+  "Thresholds: UMIs >= %d | genes >= %d | complexity >= %.2f | mito < %d%%",
+  low_umi, low_feature, low_complexity, high_mito
+))
+message(sprintf(
+  "Cells retained: %d of %d donor-assigned cells (%.1f%%)",
+  ncol(test_subset),
+  sum(!is.na(gex$donor)),
+  100 * ncol(test_subset) / sum(!is.na(gex$donor))
+))
+```
+
+```{r apply-qc-filters}
+# Step 1: Remove unassigned cells
+message(sprintf("Total cells before any filtering: %d", ncol(gex)))
+
+gex <- gex[, !is.na(gex$donor)]
+
+message(sprintf("After removing NA-donor cells: %d", ncol(gex)))
+
+# Step 2: Apply QC thresholds using the variables defined above
+gex_subset <- subset(
+  x = gex,
+  subset = (nFeature_RNA     >= low_feature)    &
+           (nCount_RNA       >= low_umi)         &
+           (log10GenesPerUMI >= low_complexity)  &
+           (percent_mito     <  high_mito)
+)
+
+message(sprintf("After QC filtering: %d cells retained", ncol(gex_subset)))
+message(sprintf(
+  "Removed by QC: %d cells (%.1f%%)",
+  ncol(gex) - ncol(gex_subset),
+  100 * (1 - ncol(gex_subset) / ncol(gex))
+))
+```
+
+```{r plot-postfilter-qc, fig.width=12, fig.height=8}
+# Compare to the pre-filter violins above. The low-quality tails should
+# be substantially reduced — but the main body of the distribution should
+# look similar, confirming we haven't over-filtered.
+p1 <- QC_Plots_UMIs(gex_subset,       low_cutoff  = low_umi,        pt.size = 0, plot_boxplot = TRUE)
+p2 <- QC_Plots_Genes(gex_subset,      low_cutoff  = low_feature,    pt.size = 0, plot_boxplot = TRUE)
+p3 <- QC_Plots_Mito(gex_subset,       high_cutoff = high_mito,      pt.size = 0, plot_boxplot = TRUE)
+p4 <- QC_Plots_Complexity(gex_subset, low_cutoff  = low_complexity, pt.size = 0, plot_boxplot = TRUE)
+
+wrap_plots(p1, p2, p3, p4, ncol = 2)
+ggsave(here("Analysis_Outputs", "3-4_qc_violins_postfilter.png"),
+       width = 12, height = 8, dpi = 300)
+
+```
+
+```{r plot-cells-per-sample, fig.width=7, fig.height=4}
+# Cells remaining per sample after filtering.
+# A large discrepancy between samples would warrant investigation —
+# it could mean one library had systematically worse quality.
+Fetch_Meta(gex_subset) %>%
+  ggplot(aes(x = orig.ident, fill = orig.ident)) +
+  geom_bar() +
+  geom_text(stat = "count", aes(label = after_stat(count)),
+            vjust = -0.5, size = 3.5) +
+  theme_classic() +
+  theme(axis.text.x    = element_text(angle = 45, vjust = 1, hjust = 1),
+        legend.position = "none") +
+  labs(title = "Cells per Sample after QC Filtering",
+       x = NULL, y = "Number of Cells")
+
+ggsave(here("Analysis_Outputs", "3-4_cells_per_sample_postfilter.png"),
+       width = 7, height = 4, dpi = 300)
+
+# Save the filtered object
+qsave(gex_subset, file.path(output_dir, "01-gex_QC_filtered.qs"))
+```
+
+------------------------------------------------------------------------
+
+# Section 4: Normalization, Dimensionality Reduction, and Clustering
+
+## 4.1 Normalization and Scaling
+
+Raw UMI counts are not directly comparable across cells because cells
+differ in how many total transcripts were captured — partly due to real
+differences in cell size and transcriptional activity, and partly due to
+technical variation in sequencing depth. A gene with 100 counts in a
+cell that has 5,000 total UMIs represents a very different expression
+level than 100 counts in a cell with 50,000 total UMIs.
+
+We apply three sequential transformations to make cells comparable:
+
+**Normalization** scales each cell's counts to a common total of 10,000
+UMIs, then log-transforms (`log1p`). This puts all cells on a comparable
+scale and compresses the dynamic range of highly expressed genes.
+
+**Variable feature selection** identifies the 2,000 genes with the
+highest cell-to-cell variation. Running PCA on all \~20,000 genes would
+add noise from housekeeping genes expressed at similar levels in every
+cell — restricting to variable features focuses the dimensionality
+reduction on genes that actually differentiate cell states.
+
+**Scaling** centers each gene to zero mean and unit variance across
+cells. This ensures that genes with high absolute expression do not
+dominate the PCA simply because of their scale.
+
+```{r normalize-scale-pca}
+# Free memory from the pre-filter object before the compute-heavy steps
+rm(gex)
+gc()
+
+# Log-normalize to 10,000 UMIs per cell
+gex_subset <- NormalizeData(gex_subset, normalization.method = "LogNormalize",
+                             scale.factor = 10000)
+
+# Identify the 2,000 most variable genes
+gex_subset <- FindVariableFeatures(gex_subset, nfeatures = 2000)
+
+# Scale — by default scales all genes, not just variable ones, which is
+# important for visualization later
+gex_subset <- ScaleData(gex_subset)
+
+pca_npcs = 30
+
+# Run PCA on the variable features
+gex_subset <- RunPCA(gex_subset, npcs = 30)
+
+# The ElbowPlot shows variance explained per PC. You are looking for the
+# "elbow" — the point at which additional PCs explain diminishing variance.
+# The PCs up to and including the elbow will be used for clustering and UMAP.
+ElbowPlot(gex_subset, ndims = 30)
+
+ggsave(here("Analysis_Outputs", "4-1_pca_elbowplot.png"),
+       width = 6, height = 4, dpi = 300)
+
+```
+
+```{r pca-feature-loadings, fig.width=10, fig.height=6}
+# Inspect what drives the top PCs. VizDimLoadings shows the genes with the
+# highest positive and negative loadings for each PC, which gives you a
+# sense of what biology each component is capturing.
+
+rownames(gex_subset@reductions$pca@feature.loadings) <- 
+  ensg_to_symbol$gene_name[match(
+    rownames(gex_subset@reductions$pca@feature.loadings),
+    ensg_to_symbol$gene_id
+  )]
+
+# Any IDs that didn't match will become NA — replace those with original ID
+na_idx <- is.na(rownames(gex_subset@reductions$pca@feature.loadings))
+rownames(gex_subset@reductions$pca@feature.loadings)[na_idx] <- 
+  rownames(gex_subset@reductions$pca@feature.loadings.projected)[na_idx]
+
+VizDimLoadings(gex_subset, dims = 1:4, reduction = "pca", ncol = 4)
+ggsave(here("Analysis_Outputs", "4-1_pca_feature_loadings.png"),
+       width = 10, height = 6, dpi = 300)
+```
+
+## 4.2 Cell Cycle Scoring
+
+NPC cultures are proliferating, which means a significant fraction of
+cells will be actively cycling at any given time. Actively cycling cells
+can cluster by cell cycle phase rather than by cell identity, which
+would obscure the biology we care about. We score every cell for
+expression of canonical S-phase and G2/M-phase gene sets to quantify
+this effect.
+
+The scores are added as covariates here and will become relevant when we
+decide whether to regress out the cell cycle signal in the next section.
+
+```{r cell-cycle-scoring}
+# Load the curated cell cycle gene sets (Ensembl IDs)
+cell_cycle_markers <- read_csv(here("cell_cycle_markers_ensembl.csv"))
+
+s.genes   <- cell_cycle_markers %>% filter(phase == "S")    %>% pull(geneID)
+g2m.genes <- cell_cycle_markers %>% filter(phase == "G2/M") %>% pull(geneID)
+
+# CellCycleScoring() assigns each cell an S.Score, G2M.Score, and a
+# predicted Phase (G1, S, or G2M) based on expression of the gene sets.
+DefaultAssay(gex_subset) <- "RNA"
+gex_subset <- CellCycleScoring(gex_subset,
+                                s.features   = s.genes,
+                                g2m.features = g2m.genes,
+                                set.ident    = TRUE)
+
+# What fraction of cells are in each phase?
+table(gex_subset$Phase)
+```
+
+## 4.3 Clustering and UMAP
+
+With PCA complete, we build a nearest-neighbor graph in PC space and
+apply the Louvain algorithm to identify clusters of transcriptionally
+similar cells. We then use UMAP to project the high-dimensional PC
+embedding into two dimensions for visualization.
+
+Two parameters govern clustering:
+
+-   **`dims`** — how many PCs to use, chosen from the elbow plot above.
+    We use 7 here based on the original analysis.
+-   **`resolution`** — controls cluster granularity. Higher values
+    produce more, smaller clusters. Start low (0.1–0.3) and increase if
+    you find clusters that seem to contain distinct biology.
+
+```{r cluster-and-umap}
+npcs <- 26  # Chosen from the elbow plot — adjust if your elbow looks different
+
+gex_subset <- gex_subset %>%
+  FindNeighbors(dims = 1:npcs) %>%
+  FindClusters(resolution = 0.2) %>%
+  RunUMAP(dims = 1:npcs, return.model = TRUE)
+  # return.model = TRUE preserves the UMAP model for projecting new data later
+
+# How many cells are in each cluster?
+table(gex_subset$seurat_clusters)
+```
+
+```{r plot-initial-umap, fig.width=12, fig.height=5}
+# UMAP colored by cluster identity
+p1 <- DimPlot(gex_subset, group.by = "seurat_clusters", label = TRUE, label.size = 4,
+              reduction = "umap") + NoLegend() +
+  labs(title = "Clusters")
+
+# UMAP colored by cell cycle phase — generated immediately so you can
+# assess whether phase structure aligns with cluster structure.
+# If cells are clustering by phase rather than cell type, regression
+# may be warranted (Section 5)
+p2 <- DimPlot(gex_subset, group.by = "Phase",
+              reduction = "umap",
+              shuffle = TRUE, seed = 42) +
+  labs(title = "Phase")
+
+p1 + p2
+
+ggsave(here("Analysis_Outputs", "4-3_initial_umap.png"),
+       width = 12, height = 5, dpi = 300)
+```
+
+```{r plot-qc-on-umap, fig.width=12, fig.height=5}
+# Overlay QC metrics on the UMAP. If filtering worked well, you should
+# not see strong gradients in mito% or nCount across the embedding.
+# Residual quality structure (e.g., a cluster with high mito) would
+# suggest those cells survived filtering but are still suspect.
+FeaturePlot(gex_subset,
+            features  = c("nCount_RNA", "percent_mito"),
+            reduction = "umap",
+            order     = TRUE,
+            ncol      = 2)
+
+ggsave(here("Analysis_Outputs", "4-3_qc_umap.png"),
+       width = 12, height = 5, dpi = 300)
+```
+
+```{r save-clustered-object}
+qsave(gex_subset, file.path(output_dir, "02-gex_clustered.qs"))
+```
+
+------------------------------------------------------------------------
+
+# Section 5: Assessing Confounders and Deciding on Cell Cycle Regression
+
+## 5.1 Diagnostic DimPlots
+
+Before annotating clusters, we need to understand what is driving their
+structure. In a multi-donor experiment, ideal clusters should reflect
+**cell type or cell state** — not donor of origin, sequencing run,
+treatment condition, or cell cycle phase. Each of these would represent
+a confounder that could lead to misannotation or incorrect biological
+conclusions.
+
+We generate a systematic set of DimPlots, coloring by different metadata
+variables, to evaluate potential sources of confounding.
+
+```{r diagnostic-dimplots, fig.width=14, fig.height=10}
+# A color palette with one distinct color per donor (38 donors)
+donor_palette <- c(
+  "#e1ab33","#6572e7","#75b235","#9943bf","#53c35e","#bc73e9","#b6be38","#6751b6",
+  "#478734","#dc60c5","#5dbf8c","#d33b88","#40c0bc","#d94b2d","#5e91e3","#dc8331",
+  "#435ea7","#a88424","#93429c","#939738","#af79cd","#9db46c","#a4437a","#36815b",
+  "#d24258","#4fa7d6","#ae502a","#787dbc","#d1ab67","#835a95","#636925","#bf9fe1",
+  "#966933","#da75b0","#e58f6c","#924861","#e28aa6","#ba6262"
+)
+
+# Treatment — if cells from different conditions cluster separately, treatment
+# is driving cluster structure before we even look at cell type. Some
+# separation is expected (lead does change gene expression), but complete
+# segregation by condition at this step would be a red flag.
+p1 <- DimPlot(gex_subset, group.by = "treatment", pt.size = 0.3,
+              shuffle = TRUE, seed = 42) +
+  labs(title = "Treatment condition")
+
+# Sequencing run — cells from the same run should be interleaved with other
+# runs. Distinct run-specific clusters indicate a technical batch effect.
+p2 <- DimPlot(gex_subset, group.by = "orig.ident", pt.size = 0.3,
+              shuffle = TRUE, seed = 42) +
+  labs(title = "Sequencing batch")
+
+# Cell cycle phase — do cells cluster by phase? If so, regression may help.
+p3 <- DimPlot(gex_subset, group.by = "Phase", pt.size = 0.3,
+              shuffle = TRUE, seed = 42) +
+  labs(title = "Cell cycle phase")
+
+# Donor — the gold standard check for genetic batch effects. You want to see
+# all 40 donor colors interleaved throughout every cluster. Distinct donor
+# "islands" would indicate that some donor cell lines may have differentiated and should be followed up on more cosely.
+p4 <- DimPlot(gex_subset, group.by = "donorlabel", pt.size = 0.3,
+              shuffle = TRUE, seed = 42) +
+  scale_color_manual("Donor", values = donor_palette) +
+  NoLegend() +
+  labs(title = "Donor")
+
+(p1 + p2) / (p3 + p4)
+
+ggsave(here("Analysis_Outputs", "5-1_confounder_dimplots.png"),
+       width = 14, height = 10, dpi = 300)
+
+```
+
+```{r faceted-by-treatment, fig.width=14, fig.height=4}
+# Faceting by treatment makes it easier to see whether one condition is
+# pulling cells into a distinct region of the UMAP.
+DimPlot(gex_subset, group.by = "treatment", pt.size = 0.3,
+        split.by = "treatment") + NoLegend()
+
+ggsave(here("Analysis_Outputs", "5-1_umap_faceted_by_treatment.png"),
+       width = 14, height = 4, dpi = 300)
+```
+
+```{r plot-donors, fig.width=14, fig.height=4}
+DimPlot(gex_subset, group.by = "donor", pt.size = 0.3,
+        cols = donor_palette,
+        shuffle = TRUE, seed = 42)
+
+ggsave(here("Analysis_Outputs", "5-1_umap_by_donor.png"),
+       width = 14, height = 6, dpi = 300)
+```
+
+## 5.2 Cell Cycle Regression — To Regress or Not
+
+Cell cycle regression is a common step in NPC analyses because these
+cells are actively proliferating and cell cycle phase can dominate gene
+expression variation. However, regression is not always necessary and
+carries a cost: removing cell cycle signal entirely can obscure real
+biology if you are interested in proliferation itself.
+
+A conservative approach is to regress out only the **difference**
+between S and G2M scores (`CC.Difference = S.Score - G2M.Score`). This
+removes the within-cycling variation (whether a cycling cell is in S vs
+G2M) while preserving the distinction between cycling (S or G2M) and
+non-cycling (G1) cells.
+
+Look at the Phase DimPlot you generated above. If cycling cells form a
+distinct cluster separated from non-cycling cells of the same type,
+regression is likely warranted. If phase is broadly distributed across
+clusters, the evidence for regression is weaker.
+
+```{r cell-cycle-regression}
+# Compute the CC.Difference score — this is what we regress out
+gex_subset$CC.Difference <- gex_subset$S.Score - gex_subset$G2M.Score
+
+# Re-scale regressing out CC.Difference, then re-run PCA, clustering, UMAP
+gex_CCR <- ScaleData(gex_subset, vars.to.regress = "CC.Difference")
+gex_CCR <- RunPCA(gex_CCR, npcs = pca_npcs)
+gex_CCR <- gex_CCR %>%
+  FindNeighbors(dims = 1:npcs) %>%
+  FindClusters(resolution = 0.2) %>%
+  RunUMAP(dims = 1:npcs)
+```
+
+```{r compare-ccr-dimplots, fig.width=14, fig.height=5}
+# Compare Phase structure before and after regression.
+# After regression, cell cycle phase should be distributed evenly across
+# all clusters rather than forming phase-specific clusters.
+p_before <- DimPlot(gex_subset, group.by = "Phase", pt.size = 0.3) +
+  labs(title = "Before CCR")
+
+p_after  <- DimPlot(gex_CCR,    group.by = "Phase", pt.size = 0.3) +
+  labs(title = "After CCR")
+
+p_before + p_after
+
+ggsave(here("Analysis_Outputs", "5-2_ccr_before_after.png"),
+       width = 14, height = 5, dpi = 300)
+```
+
+```{r save-both-objects}
+# Save both versions. Choose which to load at the start of Section 6
+# based on what you observed in the diagnostic plots.
+qsave(gex_subset, file.path(output_dir, "03-gex_no_CCR.qs"))
+qsave(gex_CCR,    file.path(output_dir, "03-gex_CCR.qs"))
+
+message("Both objects saved. Load the appropriate one at the start of Section 6.")
+```
+
+Here, we will save both Seurat objects (with and without CC regression)
+so you can decide which to use for downstream steps including
+annotation.
+
+------------------------------------------------------------------------
+
+# Section 6: Cell Type Annotation
+
+## 6.1 From Cluster Numbers to Cell Types
+
+Unsupervised clustering gives you numbered groups. Those numbers are
+analytically useful but biologically meaningless — they tell you that
+cells in cluster 3 are more similar to each other than to cells in
+cluster 7, but not what either group actually is. Annotation is the
+process of assigning biological identity to each cluster based on the
+genes it expresses.
+
+The standard approach is to identify **marker genes**: genes that are
+preferentially expressed in one cluster relative to all others. We use
+`presto::wilcoxauc()`, an extremely fast implementation of the Wilcoxon
+rank-sum test, which returns an AUC (area under the ROC curve) for every
+gene in every cluster. An AUC of 1 means the gene perfectly separates
+that cluster from all others; an AUC of 0.5 means it does no better than
+chance. We rank markers by AUC.
+
+## 6.2 Load and Inspect the Clustered Object
+
+```{r load-for-annotation, message=FALSE}
+library(presto)  # Fast Wilcoxon-based marker testing
+
+# Load whichever object you decided to use at the end of Section 5.
+# Comment out the one you are not using.
+#gex <- qread(file.path(output_dir, "03-gex_no_CCR.qs"))   # no cell cycle regression
+# gex <- qread(file.path(output_dir, "03-gex_CCR.qs"))    # with cell cycle regression
+
+gex <- gex_subset
+rm(gex_subset)
+gc()
+
+Idents(gex) <- "seurat_clusters"
+
+# Confirm the cluster structure and plot with a nice plotting package
+DimPlot_scCustom(gex, 
+                 shuffle = TRUE, 
+                 label = TRUE, 
+                 label.box = TRUE, 
+                 label.size = 4, 
+                 label.color = "black",
+                 repel = TRUE) + 
+  NoLegend() + 
+  labs(title = "Seurat Clusters")
+
+ggsave(here("Analysis_Outputs", "6-2_umap_seurat_clusters.png"),
+       width = 8, height = 7, dpi = 300,  bg = "white")
+
+table(gex$seurat_clusters)
+```
+
+## 6.3 Finding Marker Genes
+
+```{r find-markers}
+# wilcoxauc() tests every gene against every cluster in one call.
+# group_by = "seurat_clusters" tells it which grouping variable to use.
+# assay = "data" uses the log-normalized counts (not raw).
+cluster_markers <- wilcoxauc(
+  gex,
+  group_by     = "seurat_clusters",
+  assay        = "data",
+  seurat_assay = "RNA"
+)
+
+# Set factor levels for ordered output
+n_clusters <- length(unique(gex$seurat_clusters))
+cluster_markers <- cluster_markers %>%
+  mutate(group = factor(group, levels = as.character(0:(n_clusters - 1))))
+
+# Extract top 10 markers per cluster ranked by AUC
+top_markers_per_cluster <- Extract_Top_Markers(
+  marker_dataframe = cluster_markers,
+  num_genes        = 10,
+  group_by         = "group",
+  rank_by          = "auc",
+  gene_column      = "feature"
+)
+
+# Print the top markers — note these are Ensembl IDs;
+# we will relabel with gene symbols for the dot plot below
+head(top_markers_per_cluster, 20)
+```
+
+```{r convert-markers-to-symbols}
+# Convert the top marker Ensembl IDs to gene symbols for readability
+n_top_genes <- min(10 * n_clusters, length(unique(top_markers_per_cluster)))
+
+top_marker_symbols <- as_tibble(unique(top_markers_per_cluster[seq_len(n_top_genes)])) %>%
+  inner_join(ensg_to_symbol, by = c("value" = "gene_id")) %>%
+  distinct(value, .keep_all = TRUE)
+
+head(top_marker_symbols)
+```
+
+## 6.4 Visualizing Marker Expression
+
+```{r dotplot-markers, fig.width=12, fig.height=20}
+# DotPlot encodes two pieces of information per gene per cluster:
+# - Dot COLOR: mean normalized expression in that cluster
+# - Dot SIZE: fraction of cells in that cluster expressing the gene
+# Together these let you distinguish a marker that is highly expressed
+# in many cells (ideal) from one that is highly expressed in only a few.
+DotPlot_scCustom(
+  seurat_object = gex,
+  features      = unique(top_markers_per_cluster[seq_len(n_top_genes)]),
+  colors_use    = viridis_plasma_dark_high,
+  flip_axes     = TRUE,
+  x_lab_rotate  = TRUE
+) + scale_x_discrete(labels = top_marker_symbols$gene_name) +
+  labs(title = "Top 10 Marker Genes per Cluster (by AUC)")
+
+ggsave(here("Analysis_Outputs", "6-4_dotplot_top_markers_per_cluster.png"),
+       width = 12, height = 20, dpi = 300,  bg = "white")
+```
+
+```{r npc-marker-dotplot, fig.width=10, fig.height=8}
+# The NPC marker gene lists provide curated reference markers for
+# distinguishing NPCs from neurons, neural crest, and other populations.
+# Use these alongside the data-driven markers above.
+NPCvsOther  <- read_csv(here("NPCvsOther_genelist.csv"))  %>% arrange(celltype_or_region)
+NPCshort    <- read_csv(here("NPCmarkers_shortgenelist.csv")) %>% arrange(celltype_or_region)
+
+# Broad NPC vs other cell type markers
+DotPlot_scCustom(
+  seurat_object = gex,
+  features      = NPCvsOther$gene_id,
+  colors_use    = viridis_plasma_dark_high,
+  flip_axes     = TRUE
+) + scale_x_discrete(labels = NPCvsOther$gene_name) +
+  labs(title = "NPC vs Other Cell Type Markers")
+
+ggsave(here("Analysis_Outputs", "6-4_dotplot_npc_vs_other_markers.png"),
+       width = 10, height = 8, dpi = 300,  bg = "white")
+```
+
+```{r npc-shortlist-dotplot, fig.width=8, fig.height=6}
+# Shortlist of canonical NPC markers
+DotPlot_scCustom(
+  seurat_object = gex,
+  features      = NPCshort$gene_id,
+  colors_use    = viridis_plasma_dark_high,
+  flip_axes     = TRUE
+) + scale_x_discrete(labels = NPCshort$gene_name) +
+  labs(title = "Canonical NPC Marker Shortlist")
+
+ggsave(here("Analysis_Outputs", "6-4_dotplot_npc_shortlist_markers.png"),
+       width = 8, height = 6, dpi = 300,  bg = "white")
+```
+
+```{r feature-plots-npc, fig.width=14, fig.height=10}
+# FeaturePlots show where individual marker genes are expressed on the UMAP.
+# Use these alongside the dot plot to build confidence in your annotations.
+# Choose 4-6 genes that together discriminate your expected cell types.
+plots_by_type <- list()
+
+for (ct in unique(NPCshort$celltype_or_region)) {
+  
+  genes   <- NPCshort$gene_id[NPCshort$celltype_or_region == ct]
+  symbols <- NPCshort$gene_name[NPCshort$celltype_or_region == ct]
+  
+  p <- FeaturePlot_scCustom(
+    gex,
+    features    = genes,
+    reduction   = "umap",
+    order       = TRUE,
+    num_columns = 3
+  )
+  
+  # Overwrite titles with gene symbols
+  for (i in seq_along(genes)) {
+    p[[i]] <- p[[i]] + ggtitle(symbols[i])
+  }
+  
+  # Add celltype_or_region as patchwork title
+  plots_by_type[[ct]] <- p + plot_annotation(title = ct)
+}
+
+# Print all
+for (ct in names(plots_by_type)) {
+  ggsave(here("Analysis_Outputs", paste0("6-4_featureplot_", ct, ".png")),
+       plot   = plots_by_type[[ct]],
+       width  = 3 * 4,
+       height = ceiling(length(NPCshort$gene_id[NPCshort$celltype_or_region == ct]) / 3) * 4,
+       dpi    = 300)
+print(plots_by_type[[ct]])
+}
+```
+
+## 6.5 Assigning Cell Type Labels
+
+Now use the marker plots above to assign a biological identity to each
+cluster. Look up unfamiliar genes in [CellMarker
+2.0](http://bio-bigdata.hrbmu.edu.cn/CellMarker/) or
+[PanglaoDB](https://panglaodb.se/).
+
+In this dataset you should expect to find: **NPCs**, **Neurons**
+(mature), **Newborn Neurons**, and **Neural Crest** cells. One cluster
+(cluster 3 in the original analysis) had an ambiguous marker profile —
+keep an eye out for this and consider how you would handle it.
+
+`scCustomize` provides a workflow for recording your annotations in a
+CSV file and applying them back to the Seurat object. Run
+`Create_Cluster_Annotation_File()` once to generate the template, fill
+it in with your cluster labels, then load it back with
+`Pull_Cluster_Annotation()`.
+
+```{r create-annotation-template, eval=FALSE}
+# Run this ONCE to generate the annotation template CSV.
+# Fill in the new_cluster_idents and sub_type columns, then save the file.
+# Do NOT re-run this chunk after filling in the template or it will overwrite
+# your work.
+# Create_Cluster_Annotation_File(
+#   file_path = here(),
+#   file_name = "cluster_annotation"
+# )
+```
+
+```{r apply-annotation}
+# After filling in cluster_annotation.csv, run this chunk to apply labels.
+# Pull_Cluster_Annotation() reads the CSV and returns a named vector.
+annotation_info <- Pull_Cluster_Annotation(
+  annotation = here("cluster_annotation.csv")
+)
+
+# Rename_Clusters() applies the new labels as Seurat identities and
+# stores the numeric cluster IDs in a new metadata column for reference.
+Idents(gex) = "seurat_clusters"
+gex <- Rename_Clusters(
+  seurat_object = gex,
+  new_idents    = annotation_info$sub_type,
+  meta_col_name = "Res0.2_idents"
+)
+
+gex$cell_subtype  <- Idents(gex)
+Idents(gex)       <- gex$Res0.2_idents
+gex <- Rename_Clusters(
+  seurat_object = gex,
+  new_idents    = annotation_info$new_cluster_idents
+)
+
+gex$annotatedclust <- Idents(gex)
+
+# Confirm the assignment
+table(Idents(gex))
+```
+
+```{r plot-annotated-umap, fig.width=14, fig.height=5}
+# Full annotated UMAP
+dim_palette <- c("#9b78ff", "cyan", "#f78215", "#005ac7",
+                 "#c80053", "#72cd3b", "#006e36", "#a54600",
+                 "#763bc0", "#ff77f1")
+
+p_full <- DimPlot(gex, cols = dim_palette, label = TRUE,
+                  label.size = 3, repel = TRUE) +
+  labs(title = "Annotated Cell Types")
+
+# Highlight each population individually
+p_npc  <- Cluster_Highlight_Plot(gex, cluster_name = "NPCs",
+                                  highlight_color = "#9b78ff",
+                                  background_color = "lightgray")
+p_neu  <- Cluster_Highlight_Plot(gex, cluster_name = "Neurons",
+                                  highlight_color = "cyan",
+                                  background_color = "lightgray")
+p_nc   <- Cluster_Highlight_Plot(gex, cluster_name = "Neural Crest",
+                                  highlight_color = "#f78215",
+                                  background_color = "lightgray")
+#p_nbn  <- Cluster_Highlight_Plot(gex, cluster_name = "Newborn Neurons",
+#                                  highlight_color = "#005ac7",
+#                                  background_color = "lightgray")
+
+p_full / (p_npc + p_neu + p_nc)
+ggsave(here("Analysis_Outputs", "6-5_umap_annotated_clusters.png"),
+       plot   = p_full / (p_npc + p_neu + p_nc),
+       width  = 14,
+       height = 16,
+       dpi    = 300,
+       bg     = "white")
+```
+
+```{r save-annotated-object}
+# Add a group_donor column — donor x treatment combination used in pseudobulk
+gex$group_donor <- paste0(gex$treatment, "_", gex$donor)
+
+qsave(gex, file.path(output_dir, "04-gex_annotated.qs"))
+```
+
+------------------------------------------------------------------------
+
+# Section 7: Pseudobulk Differential Expression with dreamlet
+
+## 7.1 Why Pseudobulking
+
+A common mistake in scRNA-seq differential expression is treating each
+cell as an independent observation. With 40 donors each contributing
+hundreds or thousands of cells, a naive test comparing Control vs Low Pb
+cells would have tens of thousands of "samples" per condition —
+massively inflating statistical power and producing enormous numbers of
+false positives.
+
+The correct unit of biological replication in this experiment is the
+**donor**, not the cell. Ten cells from the same donor are not ten
+independent observations — they share a genome, an epigenome, and a
+culture history.
+
+**Pseudobulking** solves this by aggregating (summing) raw counts across
+all cells from the same donor and cell type, producing one pseudo-sample
+per donor per cell type. We then run a bulk RNA-seq style mixed model on
+these aggregated counts. The `dreamlet` package implements this workflow
+with a voom-style normalization followed by a linear mixed model that
+explicitly models donor as a random effect.
+
+Our model formula will be:
+
+```         
+~ (1|donor) + treatment + sex + PropPhase_G2M + PropPhase_G1
+```
+
+-   `(1|donor)` — donor is a **random effect**. This accounts for the
+    non-independence of cells from the same donor and lets the model
+    generalize across the 40-donor population rather than fitting
+    donor-specific intercepts. With 38 donors, fitting donor as a fixed
+    effect would consume 37 degrees of freedom and likely overfit.
+-   `treatment` — the **fixed effect of interest**. Coefficients for
+    `treatmentLow` and `treatmentHigh` give us the effect of each dose
+    relative to Control.
+-   `sex` — a fixed covariate to control for sex differences in baseline
+    expression.
+-   `PropPhase_G2M`, `PropPhase_G1` — the proportion of cells from each
+    donor-treatment group in each cell cycle phase, included to absorb
+    any residual cell cycle variation not addressed in Section 5.
+
+## 7.2 Preparing the Pseudobulk Object
+
+```{r prepare-pseudobulk, message=FALSE}
+library(SingleCellExperiment)  # Bioconductor class required by dreamlet
+library(dreamlet)              # Pseudobulk DE framework
+library(variancePartition)     # Mixed-model variance decomposition
+library(BiocParallel)          # Parallel processing backend
+library(qvalue)                # pi1 statistic for signal estimation
+library(ggcorrplot)            # Covariate correlation heatmap
+
+# Load the annotated object
+gex <- qread(file.path(output_dir, "04-gex_annotated.qs"))
+
+# Subset to NPCs — the cell type of primary interest for lead neurotoxicity
+gex_NPC <- subset(gex, idents = "NPCs")
+rm(gex); gc()
+
+message(sprintf("NPCs retained: %d cells", ncol(gex_NPC)))
+table(gex_NPC$treatment)
+```
+
+```{r compute-phase-proportions}
+# Compute the proportion of cells in each cell cycle phase per
+# donor-treatment group. These will be used as covariates in the model
+# to absorb any residual cell cycle variation.
+clusters_phase <- gex_NPC[[]] %>%
+  group_by(group_donor, Res0.2_idents) %>%
+  summarize(
+    PropPhase_G1  = sum(Phase == "G1")  / n(),
+    PropPhase_G2M = sum(Phase == "G2M") / n(),
+    PropPhase_S   = sum(Phase == "S")   / n(),
+    .groups = "drop"
+  )
+
+# Remove any existing PropPhase columns and add the freshly computed ones
+gex_NPC@meta.data <- gex_NPC@meta.data %>%
+  select(-starts_with("PropPhase"))
+
+gex_NPC@meta.data <- gex_NPC@meta.data %>%
+  bind_cols(
+    left_join(gex_NPC[[]], clusters_phase,
+              by = c("Res0.2_idents", "group_donor")) %>%
+      select(starts_with("PropPhase"))
+  )
+```
+
+```{r convert-to-sce-and-pseudobulk}
+# Convert to SingleCellExperiment — required by dreamlet
+gex_NPC.sce <- as.SingleCellExperiment(gex_NPC)
+rm(gex_NPC); gc()
+
+# Set factor levels so Control is the reference group in the model
+gex_NPC.sce$treatment <- factor(gex_NPC.sce$treatment,
+                                 levels = c("Control", "Low", "High"))
+
+# aggregateToPseudoBulk() sums raw counts per donor per cell type.
+# cluster_id: which metadata column identifies cell types
+# sample_id:  the unit of replication (donor x treatment)
+# Donors with fewer than the minimum number of cells in a cell type
+# will be automatically excluded from that cell type's model — this is
+# expected given the uneven donor distribution we noted in Section 2.
+pb <- aggregateToPseudoBulk(
+  gex_NPC.sce,
+  assay       = "counts",
+  cluster_id  = "ident",
+  sample_id   = "group_donor",
+  checkValues = TRUE,
+  verbose     = TRUE,
+  BPPARAM     = SnowParam(4, progressbar = TRUE)
+)
+
+# How many pseudo-samples do we have per cell type?
+table(pb$treatment)
+```
+
+## 7.3 Model Specification and Voom Normalization
+
+```{r check-covariate-correlations, fig.width=5, fig.height=4}
+# Before modeling, check whether covariates are collinear.
+# canCorPairs() computes canonical correlations between model terms.
+# Values close to 1 indicate redundant covariates that would destabilize
+# the model. Treatment and sex should be essentially uncorrelated in a
+# well-designed experiment.
+form_check <- ~ treatment + sex
+C <- canCorPairs(form_check, colData(pb))
+ggcorrplot(C, hc.order = TRUE, lab = TRUE) +
+  labs(title = "Covariate canonical correlations")
+ggsave(here("Analysis_Outputs", "6-5_donor_cluster_composition.png"),
+       width  = 10,
+       height = 8,
+       dpi    = 300,
+       bg     = "white")
+```
+
+```{r voom-normalization, fig.width=10, fig.height=4}
+# Define the full model formula
+form_dreamlet <- ~ (1|donor) + treatment + sex + PropPhase_G2M + PropPhase_G1
+
+# processAssays() performs TMM normalization and voom transformation.
+# Voom estimates the mean-variance relationship in count data and
+# produces precision weights for each observation. A well-behaved voom
+# plot shows a decreasing trend from left to right — high-count genes
+# have lower variability relative to their mean.
+res.proc <- processAssays(
+  pb,
+  form_dreamlet,
+  BPPARAM = SnowParam(4, progressbar = TRUE)
+)
+
+plotVoom(res.proc, ncol = 4)
+
+qsave(res.proc, file.path(output_dir, "05-res_proc.qs"))
+```
+
+## 7.4 Running dreamlet
+
+```{r run-dreamlet}
+# dreamlet() fits the linear mixed model for every gene in every cell type.
+# This is the main DE step — it may take a few minutes.
+res.dl <- dreamlet(
+  res.proc,
+  form_dreamlet,
+  BPPARAM = SnowParam(4, progressbar = TRUE)
+)
+
+qsave(res.dl, file.path(output_dir, "06-res_dl.qs"))
+
+# What coefficients are available? These correspond to the model terms.
+# treatmentLow and treatmentHigh are the contrasts of interest.
+coefNames(res.dl)
+```
+
+```{r extract-deg-tables}
+# Extract the full results table for each contrast.
+# topTable() returns all genes sorted by p-value, with logFC and
+# Benjamini-Hochberg adjusted p-values.
+low_effect_genes <- variancePartition::topTable(
+  res.dl[["NPCs"]],
+  coef     = "treatmentLow",
+  adjust   = "BH",
+  number   = Inf,
+  sort.by  = "P"
+) %>%
+  as_tibble(rownames = NA) %>%
+  rownames_to_column("gene_id") %>%
+  left_join(ensg_to_symbol %>% select(gene_id, gene_name), by = "gene_id")
+
+high_effect_genes <- variancePartition::topTable(
+  res.dl[["NPCs"]],
+  coef     = "treatmentHigh",
+  adjust   = "BH",
+  number   = Inf,
+  sort.by  = "P"
+) %>%
+  as_tibble(rownames = NA) %>%
+  rownames_to_column("gene_id") %>%
+  left_join(ensg_to_symbol %>% select(gene_id, gene_name), by = "gene_id")
+
+# How many DEGs at FDR < 0.05?
+message(sprintf("DEGs (FDR < 0.05) — Low Pb:  %d", sum(low_effect_genes$adj.P.Val  < 0.05)))
+message(sprintf("DEGs (FDR < 0.05) — High Pb: %d", sum(high_effect_genes$adj.P.Val < 0.05)))
+
+# Summarize signal across all assays (cell types)
+Low_stats <- topTable(res.dl, coef = "treatmentLow", number = Inf) %>%
+  as_tibble() %>%
+  group_by(assay) %>%
+  summarize(
+    nDE    = sum(adj.P.Val < 0.05),
+    pi1    = 1 - qvalue::pi0est(P.Value)$pi0,
+    nGenes = n()
+  )
+
+print(Low_stats)
+```
+
+## 7.5 Variance Partition
+
+Variance partition answers a different question from differential
+expression: rather than asking *whether* treatment changes expression of
+a given gene, it asks *how much* of that gene's total expression
+variance is attributable to each factor in the model — donor, treatment,
+sex, or residual noise.
+
+This is a powerful diagnostic. If donor explains the vast majority of
+variance for most genes, it confirms that genetic background is a
+dominant driver of NPC transcription, and underscores why the mixed
+model design is essential.
+
+```{r variance-partition, fig.width=14, fig.height=5}
+# fitVarPart() fits the variance partition model and returns per-gene
+# variance fractions for each model term.
+varpart_formula <- ~ (1|donor) + (1|treatment) + (1|sex) +
+                     PropPhase_G2M + PropPhase_G1
+
+vp <- fitVarPart(
+  res.proc,
+  varpart_formula,
+  BPPARAM = SnowParam(4, progressbar = TRUE)
+)
+
+# sortCols() orders the columns by median variance explained across genes
+plotVarPart(sortCols(vp), label.angle = 60, ncol = 4) +
+  labs(title = "Variance Partition — NPC gene expression")
+ggsave(here("Analysis_Outputs", "7-5_variance_partition.png"),
+       width = 14, height = 5, dpi = 300, bg = "white")
+
+qsave(vp, file.path(output_dir, "07-variance_partition.qs"))
+```
+
+------------------------------------------------------------------------
+
+# Section 8: Visualizing Differential Expression
+
+## 8.1 Volcano Plots
+
+A volcano plot places every gene in a two-dimensional space defined by
+effect size (log2 fold change, x-axis) and statistical confidence
+(−log10 adjusted p-value, y-axis). Genes in the upper-right quadrant are
+significantly upregulated; genes in the upper-left quadrant are
+significantly downregulated. Genes near the x-axis are not significant
+regardless of their fold change; genes near the y-axis are statistically
+significant but have small effect sizes.
+
+We use two thresholds to classify genes as "key hits": \|logFC\| \> 0.5
+and adjusted p-value \< 0.05. The 0.5 log2 fold change threshold is
+somewhat arbitrary — it represents approximately a 1.4-fold change — but
+is a common convention for identifying biologically meaningful changes.
+
+```{r volcano-low, fig.width=7, fig.height=7}
+# Volcano plot for Low Pb (3 µM) vs Control
+low_effect_genes %>%
+  mutate(
+    direction = case_when(
+      logFC >  0.5 & adj.P.Val < 0.05 ~ "UP",
+      logFC < -0.5 & adj.P.Val < 0.05 ~ "DOWN",
+      TRUE ~ "NS"
+    ),
+    label = if_else(direction %in% c("UP", "DOWN"), gene_name, NA_character_)
+  ) %>%
+  ggplot(aes(x = logFC, y = -log10(adj.P.Val), color = direction, label = label)) +
+  geom_point(alpha = 0.6, size = 1.2) +
+  geom_vline(xintercept = c(-0.5, 0.5), linetype = "dotted", color = "gray40") +
+  geom_hline(yintercept = -log10(0.05),  linetype = "dotted", color = "gray40") +
+  scale_color_manual(values = c("NS" = "grey70", "UP" = "#276bc4", "DOWN" = "#cc2132")) +
+  geom_text_repel(size = 3, max.overlaps = 8, na.rm = TRUE) +
+  theme_classic() +
+  theme(legend.position = "none") +
+  labs(title = "Low Pb (3 µM) vs Control — NPCs",
+       x = "log2 Fold Change", y = expression(-log[10]("adj. p-value")))
+
+
+ggsave(here("Analysis_Outputs", "8-1_volcano_low_pb.png"),
+       width = 7, height = 7, dpi = 300, bg = "white")
+```
+
+```{r volcano-high, fig.width=7, fig.height=7}
+# Volcano plot for High Pb (10 µM) vs Control
+high_effect_genes %>%
+  mutate(
+    direction = case_when(
+      logFC >  0.5 & adj.P.Val < 0.05 ~ "UP",
+      logFC < -0.5 & adj.P.Val < 0.05 ~ "DOWN",
+      TRUE ~ "NS"
+    ),
+    label = if_else(direction %in% c("UP", "DOWN"), gene_name, NA_character_)
+  ) %>%
+  ggplot(aes(x = logFC, y = -log10(adj.P.Val), color = direction, label = label)) +
+  geom_point(alpha = 0.6, size = 1.2) +
+  geom_vline(xintercept = c(-0.5, 0.5), linetype = "dotted", color = "gray40") +
+  geom_hline(yintercept = -log10(0.05),  linetype = "dotted", color = "gray40") +
+  scale_color_manual(values = c("NS" = "grey70", "UP" = "#276bc4", "DOWN" = "#cc2132")) +
+  geom_text_repel(size = 3, max.overlaps = 8, na.rm = TRUE) +
+  theme_classic() +
+  theme(legend.position = "none") +
+  labs(title = "High Pb (10 µM) vs Control — NPCs",
+       x = "log2 Fold Change", y = expression(-log[10]("adj. p-value")))
+
+ggsave(here("Analysis_Outputs", "8-1_volcano_high_pb.png"),
+       width = 7, height = 7, dpi = 300, bg = "white")
+```
+
+## 8.2 Pathway-Annotated Volcano
+
+When you have a specific biological hypothesis — for example, that lead
+exposure activates oxidative stress pathways — you can color volcano
+plot points by pathway membership rather than just by direction. This
+makes it immediately visible whether your hypothesis genes are enriched
+among the significant hits, and in which direction they move.
+
+```{r pathway-volcano, fig.width=9, fig.height=8}
+# Known gene sets from lead neurotoxicity literature
+keap_nfe2l2_genes <- c("NQO1","CDKN1A","EGF","SESN1","TXNRD1","ME1",
+                        "HMOX1","SLC7A11","GCLM","TKT")
+tp53_genes        <- c("FAS","TNFRSF10A","TNFRSF10D")
+elev_ca2_genes    <- c("EGF","RARRES2","SERPINE1","CD9","VEGFD","CLU","TTN")
+
+high_effect_genes %>%
+  mutate(
+    SYMBOL = toupper(gene_name),
+    pathway = case_when(
+      SYMBOL %in% keap_nfe2l2_genes    ~ "KEAP1-NFE2L2",
+      grepl("^MT1|^MT2", SYMBOL)       ~ "Metallothioneins",
+      SYMBOL %in% tp53_genes           ~ "TP53 signaling",
+      SYMBOL %in% elev_ca2_genes       ~ "Elevated cytosolic Ca2+",
+      TRUE                             ~ "Other"
+    ),
+    label = if_else(pathway != "Other" & adj.P.Val < 0.05, SYMBOL, NA_character_)
+  ) %>%
+  ggplot(aes(x = logFC, y = -log10(adj.P.Val),
+             color = pathway, label = label)) +
+  geom_point(alpha = 0.8, size = 1.5) +
+  geom_vline(xintercept = c(-0.5, 0.5), linetype = "dotted", color = "gray40") +
+  geom_hline(yintercept = -log10(0.05),  linetype = "dotted", color = "gray40") +
+  scale_color_manual(values = c(
+    "Other"                 = "grey80",
+    "KEAP1-NFE2L2"          = "#cc2132",
+    "Metallothioneins"      = "#1e9d89",
+    "TP53 signaling"        = "#b26fd6",
+    "Elevated cytosolic Ca2+" = "#f39c12"
+  )) +
+  geom_text_repel(size = 3.5, max.overlaps = 20, na.rm = TRUE,
+                  fontface = "bold") +
+  theme_classic() +
+  labs(color  = "Pathway",
+       title  = "High Pb (10 µM) — pathway-annotated volcano",
+       x      = "log2 Fold Change",
+       y      = expression(-log[10]("adj. p-value")))
+
+
+ggsave(here("Analysis_Outputs", "8-2_volcano_high_pb_pathway_annotated.png"),
+       width = 9, height = 8, dpi = 300, bg = "white")
+```
+
+## 8.3 Overlap Between Conditions
+
+How much do the transcriptional responses to Low and High Pb share in
+common? Genes shared between both conditions are likely core responses
+to Pb regardless of dose. Condition-specific genes may reflect
+dose-dependent mechanisms or off-target effects of the higher
+concentration.
+
+```{r venn-diagram, fig.width=6, fig.height=5, message=FALSE}
+library(ggVennDiagram)
+
+low_sig  <- low_effect_genes  %>% filter(abs(logFC) >= 0.5 & adj.P.Val <= 0.05) %>% pull(gene_name) %>% unique() %>% na.omit()
+high_sig <- high_effect_genes %>% filter(abs(logFC) >= 0.5 & adj.P.Val <= 0.05) %>% pull(gene_name) %>% unique() %>% na.omit()
+
+ggVennDiagram(list(Low = low_sig, High = high_sig), label_alpha = 0) +
+  scale_fill_gradient(low = "#FCE2E1", high = "#F06060") +
+  labs(title = "Overlap of significant DEGs: Low vs High Pb (|logFC| > 0.5, FDR < 0.05)") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        legend.position = "none")
+
+ggsave(here("Analysis_Outputs", "8-3_venn_deg_overlap_low_vs_high.png"),
+       width = 6, height = 5, dpi = 300, bg = "white")
+```
+
+```{r save-deg-tables}
+# Save DEG tables — used in Section 9 for GSEA
+saveRDS(low_effect_genes,  file.path(output_dir, "08-DEGs_Low.rds"))
+saveRDS(high_effect_genes, file.path(output_dir, "08-DEGs_High.rds"))
+```
+
+------------------------------------------------------------------------
+
+# Section 9: Gene Set Enrichment Analysis with fgsea
+
+## 9.1 From Gene Lists to Pathways
+
+A DEG list tells you which individual genes change — but biological
+processes are not enacted by single genes, they emerge from coordinated
+changes across many genes working in the same pathway. Gene Set
+Enrichment Analysis (GSEA) shifts the question from "which genes are
+significant?" to "which pathways are systematically enriched among the
+most strongly changed genes?"
+
+GSEA works on a **ranked gene list** rather than a binary
+significant/not significant classification. Every gene in the experiment
+is ranked by a score that encodes both direction and significance — here
+we use −log10(adj.P.Val) × sign(logFC), so genes at the top of the list
+are significantly upregulated and genes at the bottom are significantly
+downregulated. GSEA then asks: for a given gene set (e.g., all genes in
+the Reactome "DNA Repair" pathway), are members of that set concentrated
+at the top or bottom of the ranked list, or scattered randomly
+throughout?
+
+The output is a **Normalized Enrichment Score (NES)**: positive NES
+means the pathway is enriched among upregulated genes; negative NES
+means it is enriched among downregulated genes. P-values are estimated
+by permutation.
+
+An important advantage of this approach over simple overlap tests
+(over-representation analysis) is that it uses the full ranked list —
+genes that don't pass a significance threshold but consistently move in
+the same direction still contribute to pathway enrichment.
+
+## 9.2 Loading Pathway Gene Sets
+
+```{r load-pathways, message=FALSE}
+library(fgsea)     # Fast GSEA implementation (Korotkevich et al.)
+library(msigdbr)   # Programmatic access to MSigDB
+
+# We query the Molecular Signatures Database (MSigDB) for curated pathway
+# gene sets. The gene sets use Ensembl IDs, which match our DEG tables.
+
+# C2: Curated gene sets — Reactome, BioCarta, WikiPathways
+reactome <- msigdbr(species = "Homo sapiens",
+                    category = "C2", subcategory = "CP:REACTOME")
+reactome.list <- split(reactome$ensembl_gene, reactome$gs_name)
+
+biocarta <- msigdbr(species = "Homo sapiens",
+                    category = "C2", subcategory = "CP:BIOCARTA")
+biocarta.list <- split(biocarta$ensembl_gene, biocarta$gs_name)
+
+wiki <- msigdbr(species = "Homo sapiens",
+                category = "C2", subcategory = "CP:WIKIPATHWAYS")
+wiki.list <- split(wiki$ensembl_gene, wiki$gs_name)
+
+# Combine curated sets into one searchable list
+c2_list <- c(reactome.list, biocarta.list, wiki.list)
+
+# C5: Gene Ontology biological process, molecular function, cellular component
+go <- msigdbr(species = "Homo sapiens", category = "C5")
+go.list <- split(go$ensembl_gene, go$gs_name)
+
+message(sprintf("Reactome: %d gene sets", length(reactome.list)))
+message(sprintf("Combined C2: %d gene sets", length(c2_list)))
+message(sprintf("GO (C5): %d gene sets",     length(go.list)))
+```
+
+## 9.3 Running fgsea
+
+```{r run-fgsea}
+# Helper function to build the ranked gene list and run fgseaMultilevel
+run_gsea <- function(deg_table, pathway_list, seed = 19) {
+  # Rank genes by signed significance
+  # Genes at the top: significantly upregulated
+  # Genes at the bottom: significantly downregulated
+  ranked <- -log10(deg_table$adj.P.Val) * sign(deg_table$logFC)
+  names(ranked) <- deg_table$gene_id
+  ranked <- sort(ranked, decreasing = TRUE)
+
+  set.seed(seed)
+  fgseaMultilevel(
+    pathways = pathway_list,
+    stats    = ranked,
+    minSize  = 15,    # Pathways smaller than this are too noisy
+    maxSize  = 500    # Pathways larger than this are too broad to interpret
+  )
+}
+
+# Run against Reactome for both conditions
+gsea_low_reactome  <- run_gsea(low_effect_genes,  reactome.list)
+gsea_high_reactome <- run_gsea(high_effect_genes, reactome.list)
+
+# Top significant pathways for Low Pb
+gsea_low_reactome %>%
+  filter(padj < 0.05) %>%
+  arrange(padj) %>%
+  select(pathway, NES, padj, size) %>%
+  head(20)
+```
+
+## 9.4 Visualizing GSEA Results
+
+```{r plot-gsea-low, fig.width=11, fig.height=7}
+# Lollipop plot of top enriched and depleted Reactome pathways — Low Pb
+top_up   <- gsea_low_reactome %>% filter(NES > 0) %>% slice_min(padj, n = 10)
+top_down <- gsea_low_reactome %>% filter(NES < 0) %>% slice_min(padj, n = 10)
+top_low  <- bind_rows(top_up, top_down)
+
+ggplot(top_low, aes(x = reorder(pathway, NES), y = NES)) +
+  geom_segment(aes(xend = reorder(pathway, NES), yend = 0), color = "gray60") +
+  geom_point(aes(fill = ifelse(padj < 0.05, NES > 0, "ns")),
+             pch = 21, size = 4, stroke = 0.8) +
+  scale_fill_manual(
+    name   = "Direction",
+    values = c("TRUE" = "#cc2132", "FALSE" = "#276bc4", "ns" = "white"),
+    labels = c("TRUE" = "Upregulated", "FALSE" = "Downregulated",
+               "ns"   = "Not significant")
+  ) +
+  coord_flip() +
+  geom_hline(yintercept = 0, linewidth = 0.4) +
+  ylim(c(-3, 3)) +
+  theme_classic() +
+  theme(panel.border = element_rect(color = "black", fill = NA)) +
+  labs(x = NULL, y = "Normalized Enrichment Score (NES)",
+       title = "Top Reactome Pathways — Low Pb (3 µM) vs Control")
+
+ggsave(here("Analysis_Outputs", "9-4_gsea_reactome_low_pb.png"),
+       width = 11, height = 7, dpi = 300, bg = "white")
+```
+
+```{r plot-gsea-high, fig.width=11, fig.height=7}
+# Lollipop plot for High Pb
+top_up    <- gsea_high_reactome %>% filter(NES > 0) %>% slice_min(padj, n = 10)
+top_down  <- gsea_high_reactome %>% filter(NES < 0) %>% slice_min(padj, n = 10)
+top_high  <- bind_rows(top_up, top_down)
+
+ggplot(top_high, aes(x = reorder(pathway, NES), y = NES)) +
+  geom_segment(aes(xend = reorder(pathway, NES), yend = 0), color = "gray60") +
+  geom_point(aes(fill = ifelse(padj < 0.05, NES > 0, "ns")),
+             pch = 21, size = 4, stroke = 0.8) +
+  scale_fill_manual(
+    name   = "Direction",
+    values = c("TRUE" = "#cc2132", "FALSE" = "#276bc4", "ns" = "white"),
+    labels = c("TRUE" = "Upregulated", "FALSE" = "Downregulated",
+               "ns"   = "Not significant")
+  ) +
+  coord_flip() +
+  geom_hline(yintercept = 0, linewidth = 0.4) +
+  ylim(c(-3, 3)) +
+  theme_classic() +
+  theme(panel.border = element_rect(color = "black", fill = NA)) +
+  labs(x = NULL, y = "Normalized Enrichment Score (NES)",
+       title = "Top Reactome Pathways — High Pb (10 µM) vs Control")
+
+ggsave(here("Analysis_Outputs", "9-4_gsea_reactome_high_pb.png"),
+       width = 11, height = 7, dpi = 300, bg = "white")
+
+```
+
+```{r compare-shared-pathways, fig.width=9, fig.height=7}
+# Compare NES values for the same pathways across Low and High Pb.
+# Pathways that appear in both conditions with consistent NES direction
+# represent robust, dose-independent lead responses. Pathways where NES
+# changes direction or magnitude between doses reveal dose-dependent biology.
+
+shared_pathways <- inner_join(
+  gsea_low_reactome  %>% select(pathway, NES_low  = NES, padj_low  = padj),
+  gsea_high_reactome %>% select(pathway, NES_high = NES, padj_high = padj),
+  by = "pathway"
+) %>%
+  filter(padj_low < 0.05 | padj_high < 0.05)
+
+ggplot(shared_pathways, aes(x = NES_low, y = NES_high)) +
+  geom_point(alpha = 0.6, size = 2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  geom_hline(yintercept = 0, color = "gray60", linewidth = 0.4) +
+  geom_vline(xintercept = 0, color = "gray60", linewidth = 0.4) +
+  geom_text_repel(
+    data = shared_pathways %>% filter(abs(NES_low) > 1.5 | abs(NES_high) > 1.5),
+    aes(label = pathway), size = 2.5, max.overlaps = 10
+  ) +
+  theme_classic() +
+  labs(title = "NES comparison: Low vs High Pb (shared significant pathways)",
+       x = "NES — Low Pb (3 µM)",
+       y = "NES — High Pb (10 µM)")
+
+ggsave(here("Analysis_Outputs", "9-4_gsea_nes_comparison_low_vs_high.png"),
+       width = 9, height = 7, dpi = 300, bg = "white")
+```
+
+------------------------------------------------------------------------
+
+------------------------------------------------------------------------
+
+# Section 10: WGCNA Co-expression Module-Trait Analysis
+
+## 10.1 Overview
+
+Differential expression tells us which individual genes respond to lead.
+WGCNA (Weighted Gene Co-expression Network Analysis) asks a complemen-
+tary question: are there **modules** of co-expressed genes whose
+coordinated activity correlates with a donor's intrinsic sensitivity or
+resistance to lead?
+
+To quantify lead sensitivity per donor, we use **townlet estimates** —
+donor-level effect size estimates (β) computed from the same pseudobulk
+model. A large positive β means a donor's NPCs showed a strong
+transcriptional response to lead; a negative β means their NPCs were
+relatively resistant. We correlate each WGCNA module's eigengene (the
+first principal component of module expression) with these per-donor
+sensitivity scores to identify modules that track with lead response.
+
+## 10.2 Prepare Expression Matrix
+```{r wgcna-prep, message=FALSE}
+library(WGCNA)
+
+options(stringsAsFactors = FALSE)
+enableWGCNAThreads()
+
+# Extract normalized expression matrix from dreamlet processed object
+expr_df <- extractData(res.proc, "NPCs")
+
+# Separate gene expression columns (Ensembl IDs) from metadata
+gene_cols    <- grepl("^ENSG", colnames(expr_df))
+expr_mat_t   <- as.matrix(expr_df[, gene_cols])
+rownames(expr_mat_t) <- expr_df$Row.names
+
+message(sprintf("Expression matrix: %d samples x %d genes",
+                nrow(expr_mat_t), ncol(expr_mat_t)))
+
+# Check for genes/samples with too many missing values or zero variance
+gsg <- goodSamplesGenes(expr_mat_t, verbose = 3)
+
+if (!gsg$allOK) {
+  if (sum(!gsg$goodGenes) > 0)
+    message(sprintf("Removing %d genes flagged by goodSamplesGenes",
+                    sum(!gsg$goodGenes)))
+  if (sum(!gsg$goodSamples) > 0)
+    message(sprintf("Removing %d samples flagged by goodSamplesGenes",
+                    sum(!gsg$goodSamples)))
+  expr_mat_t <- expr_mat_t[gsg$goodSamples, gsg$goodGenes]
+}
+
+message(sprintf("Final matrix for WGCNA: %d samples x %d genes",
+                nrow(expr_mat_t), ncol(expr_mat_t)))
+
+```
+
+
+```{r plot-sample-tree, fig.width=12, fig.height=5}
+par(cex = 0.6, mar = c(0, 4, 2, 0))
+plot(sampleTree, main = "Sample clustering to detect outliers",
+     sub = "", xlab = "",
+     cex.lab = 1.5, cex.axis = 1.5, cex.main = 2)
+
+ggsave <- function(...) invisible(NULL)  # placeholder — use dev.copy for base plots
+png(here("Analysis_Outputs", "10-2_wgcna_sample_tree.png"),
+    width = 12, height = 5, units = "in", res = 300)
+par(cex = 0.6, mar = c(0, 4, 2, 0))
+plot(sampleTree, main = "Sample clustering to detect outliers",
+     sub = "", xlab = "", cex.lab = 1.5, cex.axis = 1.5, cex.main = 2)
+dev.off()
+```
+
+## 10.3 Load Townlet Sensitivity Estimates
+```{r load-townlet}
+# Load donor-level lead sensitivity estimates from townlet
+townlet <- read_csv(here("townlet_donor_estimates.csv"))
+
+head(townlet)
+
+# Extract donor names from expression matrix rownames
+# Format is Treatment_DonorName_Pxx_xxxxxx — strip prefix and suffix
+extracted_donors <- sub("^[^_]+_", "", rownames(expr_mat_t))
+extracted_donors <- sub("_P[0-9]+_[0-9]+$", "", extracted_donors)
+
+# Keep only samples whose donor is present in townlet
+# (Genea16, HUES64, WA7 are excluded as siblings)
+keep_samples     <- extracted_donors %in% townlet$donor
+expr_mat_t       <- expr_mat_t[keep_samples, ]
+extracted_donors <- extracted_donors[keep_samples]
+
+message(sprintf("Samples after removing excluded donors: %d", nrow(expr_mat_t)))
+stopifnot(all(extracted_donors %in% townlet$donor))
+
+# Build trait matrix — one row per pseudosample, matched to townlet estimates
+# mean_beta: donor's average transcriptional response to lead
+# mean_tau:  donor-specific deviation from population mean response
+trait_data <- data.frame(
+  row.names = rownames(expr_mat_t),
+  donor     = extracted_donors
+) %>%
+  left_join(
+    townlet %>% select(donor, mean_beta, mean_tau, sig_vs_baseline),
+    by = "donor"
+  ) %>%
+  mutate(sig_numeric = as.numeric(sig_vs_baseline)) %>%
+  select(mean_beta, mean_tau, sig_numeric)
+
+head(trait_data)
+```
+
+## 10.4 Choose Soft Thresholding Power
+```{r soft-threshold, fig.width=10, fig.height=5}
+# WGCNA uses a soft thresholding power β to emphasize strong correlations
+# and suppress weak ones, approximating a scale-free network topology.
+# We test a range of powers and choose the lowest that achieves a
+# scale-free topology fit (R² ≥ 0.85).
+powers <- c(1:10, seq(12, 20, by = 2))
+
+sft <- pickSoftThreshold(
+  expr_mat_t,
+  powerVector  = powers,
+  verbose      = 5,
+  networkType  = "signed"
+)
+
+# Plot scale-free fit and mean connectivity
+p1 <- ggplot(data.frame(Power = sft$fitIndices$Power,
+                         SFT   = -sign(sft$fitIndices$slope) *
+                                   sft$fitIndices$SFT.R.sq),
+             aes(x = Power, y = SFT)) +
+  geom_point(size = 3) +
+  geom_text(aes(label = Power), hjust = -0.3, size = 3) +
+  geom_hline(yintercept = 0.85, linetype = "dashed", color = "red") +
+  theme_classic() +
+  labs(title = "Scale-free topology fit",
+       x = "Soft threshold (power)", y = "Scale free topology R²")
+
+p2 <- ggplot(data.frame(Power = sft$fitIndices$Power,
+                         MeanK = sft$fitIndices$mean.k.),
+             aes(x = Power, y = MeanK)) +
+  geom_point(size = 3) +
+  geom_text(aes(label = Power), hjust = -0.3, size = 3) +
+  theme_classic() +
+  labs(title = "Mean connectivity",
+       x = "Soft threshold (power)", y = "Mean connectivity")
+
+p1 + p2
+
+ggsave(here("Analysis_Outputs", "10-4_wgcna_soft_threshold.png"),
+       width = 10, height = 5, dpi = 300, bg = "white")
+
+# The recommended soft power — look for the knee in the R² plot
+# where R² first exceeds 0.85. Adjust this value based on your plot.
+soft_power <- sft$powerEstimate
+message(sprintf("Recommended soft power: %d", soft_power))
+```
+
+## 10.5 Build the Co-expression Network
+```{r build-network, message=FALSE}
+# blockwiseModules() constructs the weighted gene network, performs
+# hierarchical clustering, and assigns genes to modules in one call.
+# This is the most compute-intensive step — expect several minutes.
+#
+# Key parameters:
+# power:             soft thresholding power from above
+# networkType:       "signed" preserves the direction of correlation
+# minModuleSize:     minimum number of genes per module (30 is standard)
+# mergeCutHeight:    modules with eigengene correlation > (1 - this value)
+#                    are merged; 0.25 is a common default
+# TOMType:           "signed" for signed network
+
+soft_power <- 12
+net <- blockwiseModules(
+  expr_mat_t,
+  power             = soft_power,
+  networkType       = "signed",
+  TOMType           = "signed",
+  minModuleSize     = 30,
+  mergeCutHeight    = 0.25,
+  numericLabels     = FALSE,
+  pamRespectsDendro = FALSE,
+  saveTOMs          = FALSE,
+  verbose           = 3
+)
+
+# How many modules were identified, and how many genes per module?
+table(net$colors)
+message(sprintf("Total modules identified: %d (excluding grey/unassigned)",
+                sum(names(table(net$colors)) != "grey")))
+```
+
+
+```{r plot-dendrogram, fig.width=14, fig.height=6}
+# Visualize the gene dendrogram with module color assignments
+png(here("Analysis_Outputs", "10-5_wgcna_dendrogram.png"),
+    width = 14, height = 6, units = "in", res = 300)
+plotDendroAndColors(
+  net$dendrograms[[1]],
+  net$colors[net$blockGenes[[1]]],
+  "Module colors",
+  dendroLabels  = FALSE,
+  hang          = 0.03,
+  addGuide      = TRUE,
+  guideHang     = 0.05,
+  main          = "Gene dendrogram and module colors"
+)
+dev.off()
+
+plotDendroAndColors(
+  net$dendrograms[[1]],
+  net$colors[net$blockGenes[[1]]],
+  "Module colors",
+  dendroLabels  = FALSE,
+  hang          = 0.03,
+  addGuide      = TRUE,
+  guideHang     = 0.05,
+  main          = "Gene dendrogram and module colors"
+)
+```
+
+## 10.6 Module-Trait Correlation
+```{r module-eigengenes}
+# Extract module eigengenes — the first PC of each module's expression,
+# summarizing the overall activity level of that module per sample.
+MEs <- moduleEigengenes(expr_mat_t, colors = net$colors)$eigengenes
+MEs <- orderMEs(MEs)
+
+# Extract donor name from the pseudobulk sample ID (format: treatment_donor)
+# and match to townlet estimates
+sample_donors <- sub("^[^_]+_", "", rownames(MEs))
+
+# Build the trait matrix — one row per pseudosample
+# We use mean_beta as the primary sensitivity trait
+trait_data <- data.frame(
+  sample_id = rownames(expr_mat_t),
+  donor     = extracted_donors
+) %>%
+  left_join(
+    townlet %>% select(donor, mean_beta, mean_tau, sig_vs_baseline),
+    by = "donor"
+  ) %>%
+  mutate(sig_numeric = as.numeric(sig_vs_baseline)) %>%
+  select(sample_id, mean_beta, mean_tau, sig_numeric) %>%
+  column_to_rownames("sample_id")
+
+# Verify it looks right
+head(trait_data)
+sum(is.na(trait_data$mean_beta))  # should be 0
+
+# Compute Pearson correlations between module eigengenes and traits
+moduleTraitCor  <- cor(MEs, trait_data, use = "pairwise.complete.obs")
+moduleTraitPval <- corPvalueStudent(moduleTraitCor, nrow(MEs))
+```
+
+
+```{r plot-module-trait-heatmap, fig.width=10, fig.height=12}
+# Heatmap of module-trait correlations.
+# Each cell shows r (top) and p-value (bottom).
+# Modules with strong positive correlation to mean_beta are activated
+# in lead-sensitive donors; negative correlation = activated in resistant donors.
+textMatrix <- paste0(
+  signif(moduleTraitCor, 2), "\n(",
+  signif(moduleTraitPval, 1), ")"
+)
+dim(textMatrix) <- dim(moduleTraitCor)
+
+# Plot
+par(mar = c(6, 8.5, 3, 3))
+labeledHeatmap(
+  Matrix        = moduleTraitCor,
+  xLabels       = c("Lead sensitivity\n(mean β)", "Tau effect\n(mean τ)", "Sig. vs baseline"),
+  yLabels       = names(MEs),
+  ySymbols      = names(MEs),
+  colorLabels   = FALSE,
+  colors        = blueWhiteRed(50),
+  textMatrix    = textMatrix,
+  setStdMargins = FALSE,
+  cex.text      = 0.5,
+  zlim          = c(-1, 1),
+  main          = "Module-trait relationships"
+)
+dev.off()
+
+par(mar = c(6, 8.5, 3, 3))
+labeledHeatmap(
+  Matrix      = moduleTraitCor,
+  xLabels     = c("Lead sensitivity\n(mean β)", "Tau effect\n(mean τ)", "Sig. vs baseline"),
+  yLabels     = names(MEs),
+  ySymbols    = names(MEs),
+  colorLabels = FALSE,
+  colors      = blueWhiteRed(50),
+  textMatrix  = textMatrix,
+  setStdMargins = FALSE,
+  cex.text    = 0.5,
+  zlim        = c(-1, 1),
+  main        = "Module-trait relationships"
+)
+```
+
+## 10.7 Identifying Hub Genes in Significant Modules
+```{r hub-genes}
+# Identify modules significantly correlated with lead sensitivity (mean_beta)
+# Use FDR-corrected p-values across all module-trait pairs
+sig_modules <- data.frame(
+  module  = rownames(moduleTraitCor),
+  r       = moduleTraitCor[, "mean_beta"],
+  p       = moduleTraitPval[, "mean_beta"]
+) %>%
+  mutate(
+    padj      = p.adjust(p, method = "BH"),
+    direction = ifelse(r > 0, "Sensitive", "Resistant")
+  ) %>%
+  filter(padj < 0.05) %>%
+  arrange(padj)
+
+print(sig_modules)
+
+# For each significant module, extract the top hub genes —
+# genes with the highest module membership (kME), which is the
+# correlation of a gene's expression with the module eigengene.
+# Hub genes are the most central and likely most functionally important
+# members of the module.
+kME <- signedKME(expr_mat_t, MEs, outputColumnName = "kME")
+
+hub_gene_list <- list()
+
+for (mod in sig_modules$module) {
+  mod_color <- gsub("^ME", "", mod)
+  mod_genes <- names(net$colors)[net$colors == mod_color]
+  kme_col   <- paste0("kME", mod_color)
+  
+  hub_genes <- data.frame(
+    gene_id = mod_genes,
+    kME     = kME[mod_genes, kme_col]
+  ) %>%
+    arrange(desc(abs(kME))) %>%
+    slice_head(n = 20) %>%
+    left_join(ensg_to_symbol %>% select(gene_id, gene_name), by = "gene_id")
+  
+  hub_gene_list[[mod_color]] <- hub_genes
+  message(sprintf("\nTop hub genes — %s module (r = %.2f, padj = %.3f):",
+                  mod_color, sig_modules$r[sig_modules$module == mod],
+                  sig_modules$padj[sig_modules$module == mod]))
+  print(hub_genes %>% select(gene_name, kME))
+}
+
+# Save hub gene tables
+hub_gene_df <- bind_rows(hub_gene_list, .id = "module")
+write_csv(hub_gene_df, here("Analysis_Outputs", "10-7_wgcna_hub_genes.csv"))
+```
+
+```{r wgcna-enrichment, fig.width=10, fig.height=6}
+# Run GSEA on hub genes for each significant module using kME as the ranking
+# statistic — genes with highest kME are most central to the module
+module_gsea_results <- list()
+
+for (mod_color in names(hub_gene_list)) {
+  
+  r_beta        <- sig_modules$r[sig_modules$module == paste0("ME", mod_color)]
+  kme_col       <- paste0("kME", mod_color)
+  all_mod_genes <- names(net$colors)[net$colors == mod_color]
+  
+  # Annotate hub genes with direction relative to lead sensitivity
+  # sign(kME) * sign(r_beta): +1 = high in sensitive, -1 = high in resistant
+  hub_gene_list[[mod_color]] <- hub_gene_list[[mod_color]] %>%
+    mutate(
+      direction_vs_sensitivity = case_when(
+        sign(kME) * sign(r_beta) > 0 ~ "High in sensitive donors",
+        sign(kME) * sign(r_beta) < 0 ~ "High in resistant donors",
+        TRUE ~ "neutral"
+      )
+    )
+  
+  # Build ranked list corrected for sensitivity direction:
+  # positive rank = associated with lead sensitivity
+  # negative rank = associated with lead resistance
+  ranked <- kME[all_mod_genes, kme_col] * sign(r_beta)
+  names(ranked) <- all_mod_genes
+  ranked <- sort(ranked, decreasing = TRUE)
+  ranked <- ranked[!is.na(ranked)]
+  
+  # Run GSEA against Reactome
+  set.seed(42)
+  gsea_res <- fgseaMultilevel(
+    pathways = reactome.list,
+    stats    = ranked,
+    minSize  = 10,
+    maxSize  = 500
+  )
+  
+  module_gsea_results[[mod_color]] <- gsea_res %>%
+    filter(padj < 0.05) %>%
+    arrange(padj)
+  
+  message(sprintf("\n--- %s module (r_beta = %.2f, %s) --- %d significant pathways",
+                  mod_color, r_beta,
+                  sig_modules$direction[sig_modules$module == paste0("ME", mod_color)],
+                  nrow(module_gsea_results[[mod_color]])))
+  
+  print(module_gsea_results[[mod_color]] %>%
+          select(pathway, NES, padj) %>%
+          head(15))
+}
+
+# Print hub gene directionality summary for top modules
+for (mod_color in c("greenyellow", "brown", "red")) {
+  r_beta <- sig_modules$r[sig_modules$module == paste0("ME", mod_color)]
+  message(sprintf("\n--- ME%s hub genes (r_beta = %.2f) ---", mod_color, r_beta))
+  print(
+    hub_gene_list[[mod_color]] %>%
+      select(gene_name, kME, direction_vs_sensitivity) %>%
+      head(20)
+  )
+}
+
+# Save results
+saveRDS(module_gsea_results,
+        file.path(output_dir, "10-7_wgcna_module_gsea.rds"))
+write_csv(
+  bind_rows(module_gsea_results, .id = "module"),
+  here("Analysis_Outputs", "10-7_wgcna_module_pathway_enrichment.csv")
+)
+
+# Lollipop plots for top three modules
+# Positive NES = enriched in sensitive donors
+# Negative NES = enriched in resistant donors
+for (mod_color in c("greenyellow", "brown", "red")) {
+  
+  if (nrow(module_gsea_results[[mod_color]]) == 0) {
+    message(sprintf("No significant pathways for %s module", mod_color))
+    next
+  }
+  
+  direction_label <- sig_modules$direction[
+    sig_modules$module == paste0("ME", mod_color)]
+  r_beta <- sig_modules$r[sig_modules$module == paste0("ME", mod_color)]
+  padj   <- sig_modules$padj[sig_modules$module == paste0("ME", mod_color)]
+  
+  top_up   <- module_gsea_results[[mod_color]] %>%
+    filter(NES > 0) %>% slice_min(padj, n = 10)
+  top_down <- module_gsea_results[[mod_color]] %>%
+    filter(NES < 0) %>% slice_min(padj, n = 10)
+  top_paths <- bind_rows(top_up, top_down)
+  
+  if (nrow(top_paths) == 0) next
+  
+  top_paths <- top_paths %>%
+    mutate(
+      pathway = gsub("REACTOME_", "", pathway),
+      pathway = gsub("_", " ", pathway),
+      pathway = str_to_title(pathway)
+    )
+  
+  p <- ggplot(top_paths, aes(x = reorder(pathway, NES), y = NES)) +
+    geom_segment(aes(xend = reorder(pathway, NES), yend = 0),
+                 color = "gray60") +
+    geom_point(aes(fill = NES > 0), pch = 21, size = 4, stroke = 0.8) +
+    scale_fill_manual(
+      values = c("TRUE"  = "#cc2132", "FALSE" = "#276bc4"),
+      labels = c("TRUE"  = "High in sensitive donors",
+                 "FALSE" = "High in resistant donors"),
+      name   = NULL
+    ) +
+    coord_flip() +
+    geom_hline(yintercept = 0, linewidth = 0.4) +
+    theme_classic() +
+    theme(panel.border = element_rect(color = "black", fill = NA)) +
+    labs(
+      x        = NULL,
+      y        = "Normalized Enrichment Score (NES)",
+      title    = sprintf("ME%s module — Reactome pathway enrichment", mod_color),
+      subtitle = sprintf("Lead %s module  |  r = %.2f, padj = %.2e",
+                         direction_label, r_beta, padj)
+    )
+  
+  print(p)
+  
+  ggsave(
+    here("Analysis_Outputs",
+         sprintf("10-7_wgcna_pathways_%s_module.png", mod_color)),
+    plot   = p,
+    width  = 11,
+    height = 7,
+    dpi    = 300,
+    bg     = "white"
+  )
+}
+```
+
+```{r}
+# Merge eigengenes with trait data and donor info for plotting
+ME_wide <- MEs %>%
+  as.data.frame() %>%
+  rownames_to_column("sample_id") %>%
+  mutate(donor = extracted_donors) %>%
+  left_join(townlet %>% select(donor, mean_beta, sig_vs_baseline),
+            by = "donor")
+
+# Verify mean_beta is here before pivoting
+head(ME_wide %>% select(sample_id, donor, mean_beta))
+
+# Step 2: pivot only the ME columns
+ME_plot_data <- ME_wide %>%
+  pivot_longer(
+    cols      = matches("^ME[a-z]"),
+    names_to  = "module",
+    values_to = "eigengene"
+  ) %>%
+  filter(module %in% sig_modules$module) %>%
+  left_join(sig_modules %>% select(module, r, padj, direction),
+            by = "module") %>%
+  # join mean_beta back in from ME_wide after pivoting
+  left_join(ME_wide %>% select(sample_id, mean_beta), by = "sample_id") %>%
+  mutate(
+    module_label = sprintf("%s\nr = %.2f, padj = %.2e", module, r, padj),
+    module_label = factor(module_label,
+                          levels = unique(module_label[order(abs(r),
+                                                             decreasing = TRUE)]))
+  )
+
+head(ME_plot_data %>% select(sample_id, donor, mean_beta, eigengene, module))
+ggplot(ME_plot_data, aes(x = eigengene, y = mean_beta)) +
+  geom_point(aes(color = sig_vs_baseline), alpha = 0.6, size = 1.5) +
+  geom_smooth(method = "lm", se = TRUE, color = "black",
+              linewidth = 0.8, alpha = 0.15) +
+  scale_color_manual(
+    values = c("TRUE" = "#cc2132", "FALSE" = "grey60"),
+    labels = c("TRUE" = "Sig. vs baseline", "FALSE" = "Not significant"),
+    name   = NULL
+  ) +
+  facet_wrap(~ module_label, scales = "free_x", ncol = 4) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40",
+             linewidth = 0.4) +
+  theme_classic() +
+  theme(
+    strip.background = element_blank(),
+    strip.text       = element_text(size = 8, face = "bold"),
+    panel.border     = element_rect(color = "black", fill = NA)
+  ) +
+  labs(
+    x     = "Module eigengene expression",
+    y     = "Lead sensitivity (mean β)",
+    title = "Module eigengene vs lead sensitivity per pseudosample",
+    subtitle = "Each point is one donor-treatment pseudosample (n=3 per donor) | Red = donor significantly responsive vs baseline"
+
+  )
+
+ggsave(here("Analysis_Outputs", "10-7_wgcna_eigengene_vs_sensitivity.png"),
+       width = 16, height = 10, dpi = 300, bg = "white")
+
+```
+
+
+
+
+
+```{r save-wgcna-objects}
+# Save all WGCNA outputs for reproducibility
+saveRDS(net,             file.path(output_dir, "10-wgcna_network.rds"))
+saveRDS(MEs,             file.path(output_dir, "10-wgcna_eigengenes.rds"))
+saveRDS(moduleTraitCor,  file.path(output_dir, "10-wgcna_module_trait_cor.rds"))
+write_csv(sig_modules,   here("Analysis_Outputs", "10-6_wgcna_significant_modules.csv"))
+
+message("WGCNA analysis complete. Key outputs saved to Analysis_Outputs/.")
+```
+
+
+
+
+# Session Information
+
+Recording your session information is a simple but important step for
+reproducibility. It captures the exact R and package versions used,
+allowing others (and your future self) to reproduce this analysis.
+
+```{r session-info}
+sessionInfo()
+```
