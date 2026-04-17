@@ -1,0 +1,27 @@
+gene_id,gene_name,seqnames,celltype_or_region
+ENSG00000265992,ESRG,chr3,stem_cell
+ENSG00000204531,POU5F1,chr6,stem_cell
+ENSG00000114315,HES1,chr3,NPC_canonical
+ENSG00000148773,MKI67,chr10,NPC_canonical
+ENSG00000132688,NES,chr1,NPC_canonical
+ENSG00000007372,PAX6,chr11,NPC_canonical
+ENSG00000182968,SOX1,chr13,NPC_canonical
+ENSG00000181449,SOX2,chr3,NPC_canonical
+ENSG00000011465,DCN,chr12,neural_crest
+ENSG00000019549,SNAI2,chr8,neural_crest
+ENSG00000122691,TWIST1,chr7,neural_crest
+ENSG00000095739,BAMBI,chr10,glial_progenitor
+ENSG00000162599,NFIA,chr1,glial_progenitor
+ENSG00000152583,SPARCL1,chr4,glial_progenitor
+ENSG00000162992,NEUROD1,chr2,newborn_neurons
+ENSG00000123307,NEUROD4,chr12,newborn_neurons
+ENSG00000181965,NEUROG1,chr5,newborn_neurons
+ENSG00000178403,NEUROG2,chr4,newborn_neurons
+ENSG00000162374,ELAVL4,chr1,excitatory_neurons
+ENSG00000186868,MAPT,chr17,excitatory_neurons
+ENSG00000179915,NRXN1,chr2,excitatory_neurons
+ENSG00000104435,STMN2,chr8,excitatory_neurons
+ENSG00000115507,OTX1,chr2,anterior
+ENSG00000168505,GBX2,chr2,anterior hindbrain
+ENSG00000177508,IRX3,chr16,midbrain
+ENSG00000105996,HOXA2,chr7,posterior
